@@ -79,6 +79,9 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.Capacity
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeAddedSchedulerEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeRemovedSchedulerEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent;
+
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fifo
+    .FifoScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.security.RMContainerTokenSecretManager;
 import org.apache.hadoop.yarn.server.scheduler.OpportunisticContainerContext;
 import org.apache.hadoop.yarn.util.resource.Resources;
@@ -251,8 +254,11 @@ public class TestOpportunisticContainerAllocatorAMService {
 
     Assert.assertEquals(0, allocateResponse.getUpdatedContainers().size());
     Assert.assertEquals(1, allocateResponse.getUpdateErrors().size());
-    Assert.assertEquals("INCORRECT_CONTAINER_VERSION_ERROR|1|0",
+    Assert.assertEquals("INCORRECT_CONTAINER_VERSION_ERROR",
         allocateResponse.getUpdateErrors().get(0).getReason());
+    Assert.assertEquals(0,
+        allocateResponse.getUpdateErrors().get(0)
+            .getCurrentContainerVersion());
     Assert.assertEquals(container.getId(),
         allocateResponse.getUpdateErrors().get(0)
             .getUpdateContainerRequest().getContainerId());
@@ -648,6 +654,11 @@ public class TestOpportunisticContainerAllocatorAMService {
       @Override
       public RMContainerTokenSecretManager getContainerTokenSecretManager() {
         return new RMContainerTokenSecretManager(conf);
+      }
+
+      @Override
+      public ResourceScheduler getScheduler() {
+        return new FifoScheduler();
       }
     };
     Container c = factory.newRecordInstance(Container.class);
