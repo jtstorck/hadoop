@@ -25,6 +25,9 @@ import org.apache.hadoop.io.retry.RetryPolicy;
 import org.apache.hadoop.metrics2.MetricsRecordBuilder;
 import org.apache.hadoop.security.SaslRpcServer.AuthMethod;
 import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod;
+import org.apache.hadoop.security.UserGroupInformation.HadoopConfiguration;
+import org.apache.hadoop.security.UserGroupInformation.LoginParam;
+import org.apache.hadoop.security.UserGroupInformation.LoginParams;
 import org.apache.hadoop.security.authentication.util.KerberosName;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenIdentifier;
@@ -32,7 +35,14 @@ import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
-import org.junit.*;
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
+import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.event.Level;
@@ -41,6 +51,7 @@ import javax.security.auth.Subject;
 import javax.security.auth.kerberos.KerberosPrincipal;
 import javax.security.auth.kerberos.KeyTab;
 import javax.security.auth.login.AppConfigurationEntry;
+import javax.security.auth.login.AppConfigurationEntry.LoginModuleControlFlag;
 import javax.security.auth.login.LoginContext;
 
 import java.io.BufferedReader;
@@ -48,12 +59,18 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.Method;
+import java.security.Principal;
 import java.security.PrivilegedExceptionAction;
 import java.util.Collection;
 import java.util.ConcurrentModificationException;
 import java.util.Date;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.hadoop.fs.CommonConfigurationKeys.HADOOP_USER_GROUP_METRICS_PERCENTILES_INTERVALS;
@@ -93,7 +110,14 @@ public class TestUserGroupInformation {
       throw new RuntimeException("UGI is not using its own security conf!");
     } 
   }
-  
+
+  // must be set immediately to avoid inconsistent testing issues.
+  static {
+    // fake the realm is kerberos is enabled
+    System.setProperty("java.security.krb5.kdc", "");
+    System.setProperty("java.security.krb5.realm", "DEFAULT.REALM");
+  }
+
   /** configure ugi */
   @BeforeClass
   public static void setup() {
@@ -104,9 +128,6 @@ public class TestUserGroupInformation {
     // that finds winutils.exe
     String home = System.getenv("HADOOP_HOME");
     System.setProperty("hadoop.home.dir", (home != null ? home : "."));
-    // fake the realm is kerberos is enabled
-    System.setProperty("java.security.krb5.kdc", "");
-    System.setProperty("java.security.krb5.realm", "DEFAULT.REALM");
   }
   
   @Before
@@ -1104,5 +1125,219 @@ public class TestUserGroupInformation {
         + ", retry:" + lastRetry);
     LOG.info(str);
     assertTrue(str, lower <= lastRetry && lastRetry < upper);
+  }
+
+  // verify that getCurrentUser on the same and different subjects can be
+  // concurrent.  Ie. no synchronization.
+  @Test(timeout=8000)
+  public void testConcurrentGetCurrentUser() throws Exception {
+    final CyclicBarrier barrier = new CyclicBarrier(2);
+    final CountDownLatch latch = new CountDownLatch(1);
+
+    final UserGroupInformation testUgi1 =
+        UserGroupInformation.createRemoteUser("testUgi1");
+
+    final UserGroupInformation testUgi2 =
+        UserGroupInformation.createRemoteUser("testUgi2");
+
+    // swap the User with a spy to allow getCurrentUser to block when the
+    // spy is called for the user name by an assert in the ugi ctor.
+    Set<Principal> principals = testUgi1.getSubject().getPrincipals();
+    User user =
+        testUgi1.getSubject().getPrincipals(User.class).iterator().next();
+    final User spyUser = Mockito.spy(user);
+    principals.remove(user);
+    principals.add(spyUser);
+    when(spyUser.getName()).thenAnswer(new Answer<String>(){
+      @Override
+      public String answer(InvocationOnMock invocation) throws Throwable {
+        latch.countDown();
+        barrier.await();
+        return (String)invocation.callRealMethod();
+      }
+    });
+    // wait for the thread to block on the barrier in getCurrentUser.
+    Future<UserGroupInformation> blockingLookup =
+        Executors.newSingleThreadExecutor().submit(
+            new Callable<UserGroupInformation>(){
+              @Override
+              public UserGroupInformation call() throws Exception {
+                return testUgi1.doAs(
+                    new PrivilegedExceptionAction<UserGroupInformation>() {
+                      @Override
+                      public UserGroupInformation run() throws Exception {
+                        return UserGroupInformation.getCurrentUser();
+                      }
+                    });
+              }
+            });
+    latch.await();
+
+    // old versions of mockito synchronize on returning mocked answers so
+    // the blocked getCurrentUser will block all other calls to getName.
+    // workaround this by swapping out the spy with the original User.
+    principals.remove(spyUser);
+    principals.add(user);
+    // concurrent getCurrentUser on ugi1 should not be blocked.
+    UserGroupInformation ugi;
+    ugi = testUgi1.doAs(
+        new PrivilegedExceptionAction<UserGroupInformation>() {
+          @Override
+          public UserGroupInformation run() throws Exception {
+            return UserGroupInformation.getCurrentUser();
+          }
+        });
+    assertSame(testUgi1.getSubject(), ugi.getSubject());
+    // concurrent getCurrentUser on ugi2 should not be blocked.
+    ugi = testUgi2.doAs(
+        new PrivilegedExceptionAction<UserGroupInformation>() {
+          @Override
+          public UserGroupInformation run() throws Exception {
+            return UserGroupInformation.getCurrentUser();
+          }
+        });
+    assertSame(testUgi2.getSubject(), ugi.getSubject());
+
+    // unblock the original call.
+    barrier.await();
+    assertSame(testUgi1.getSubject(), blockingLookup.get().getSubject());
+  }
+
+  static KerberosPrincipal KRB_PRINCIPAL =
+      new KerberosPrincipal("test-principal");
+  static File KEYTAB_FILE = new File("test-keytab-file");
+
+  private static Subject createSubject(KerberosPrincipal kp, KeyTab kt) {
+    Subject subject = new Subject();
+    if (kp != null) {
+      subject.getPrincipals().add(kp);
+    }
+    if (kt != null) {
+      subject.getPrivateCredentials().add(kt);
+    }
+    LOG.info("Testing subject:" + subject);
+    return subject;
+  }
+
+  private AppConfigurationEntry[] getKerberosEntries(LoginParams params,
+      int expected) {
+    AppConfigurationEntry[] entries = new HadoopConfiguration(params)
+        .getAppConfigurationEntry(HadoopConfiguration.KERBEROS_CONFIG_NAME);
+    assertEquals(stringifyEntries(entries), expected, entries.length);
+    return entries;
+  }
+
+  private void checkKerberosEntry(AppConfigurationEntry entry,
+      LoginModuleControlFlag controlFlag) {
+    assertEquals(HadoopConfiguration.KRB5_LOGIN_MODULE,
+        entry.getLoginModuleName());
+    assertEquals(controlFlag, entry.getControlFlag());
+  }
+
+  private String stringifyEntries(AppConfigurationEntry[] entries) {
+    StringBuilder sb = new StringBuilder();
+    for (AppConfigurationEntry entry : entries) {
+      if (sb.length() > 0) {
+        sb.append(", ");
+      }
+      String name = entry.getLoginModuleName();
+      sb.append("[")
+        .append(name.substring(name.lastIndexOf('.')+1))
+        .append("=")
+        .append(entry.getControlFlag())
+        .append("]");
+    }
+    return sb.toString();
+  }
+
+  @Test
+  public void testLoginParamsForDefaultLogin() {
+    // default params are not from subject.
+    LoginParams params = LoginParams.instanceFor(null);
+    assertFalse(params.containsKey(LoginParam.SUBJECT_ONLY));
+    assertFalse(params.containsKey(LoginParam.UPDATED));
+
+    AppConfigurationEntry[] entries = getKerberosEntries(params, 3);
+    assertEquals(HadoopConfiguration.OS_SPECIFIC_LOGIN, entries[0]);
+    checkKerberosEntry(entries[1], LoginModuleControlFlag.OPTIONAL);
+    assertEquals(HadoopConfiguration.HADOOP_LOGIN, entries[2]);
+
+    // add principal to simulate login. verify that principal is detected.
+    Subject subject = createSubject(KRB_PRINCIPAL, null);
+    params.updateFrom(subject);
+    assertTrue(params.containsKey(LoginParam.UPDATED));
+    assertEquals(KRB_PRINCIPAL.getName(), params.get(LoginParam.PRINCIPAL));
+    assertFalse(params.containsKey(LoginParam.KEYTAB));
+
+    // verify params do not "forget" the principal initially detected.
+    subject.getPrincipals().remove(KRB_PRINCIPAL);
+    params.updateFrom(subject);
+    assertEquals(KRB_PRINCIPAL.getName(), params.get(LoginParam.PRINCIPAL));
+  }
+
+  @Test
+  public void testLoginParamsForEmptySubject() {
+    Subject subject = new Subject();
+
+    LoginParams params = LoginParams.instanceFor(subject);
+    assertTrue(params.containsKey(LoginParam.SUBJECT_ONLY));
+    assertTrue(params.containsKey(LoginParam.UPDATED));
+    assertFalse(params.containsKey(LoginParam.PRINCIPAL));
+    assertFalse(params.containsKey(LoginParam.KEYTAB));
+
+    AppConfigurationEntry[] entries = getKerberosEntries(params, 2);
+    checkKerberosEntry(entries[0], LoginModuleControlFlag.OPTIONAL);
+    assertEquals(HadoopConfiguration.HADOOP_LOGIN, entries[1]);
+  }
+
+  @Test
+  public void testLoginParamsForSubjectPrincipal() {
+    Subject subject = createSubject(KRB_PRINCIPAL, null);
+
+    LoginParams params = LoginParams.instanceFor(subject);
+    assertTrue(params.containsKey(LoginParam.SUBJECT_ONLY));
+    assertTrue(params.containsKey(LoginParam.UPDATED));
+    assertTrue(params.containsKey(LoginParam.PRINCIPAL));
+    assertEquals(KRB_PRINCIPAL.getName(), params.get(LoginParam.PRINCIPAL));
+    assertFalse(params.containsKey(LoginParam.KEYTAB));
+
+    AppConfigurationEntry[] entries = getKerberosEntries(params, 2);
+    checkKerberosEntry(entries[0], LoginModuleControlFlag.REQUIRED);
+    assertEquals(HadoopConfiguration.HADOOP_LOGIN, entries[1]);
+  }
+
+  @Test
+  public void testLoginParamsForSubjectPrincipalAndDefaultKeytab() {
+    Subject subject = createSubject(KRB_PRINCIPAL, KeyTab.getInstance());
+
+    LoginParams params = LoginParams.instanceFor(subject);
+    assertTrue(params.containsKey(LoginParam.SUBJECT_ONLY));
+    assertTrue(params.containsKey(LoginParam.UPDATED));
+    assertTrue(params.containsKey(LoginParam.PRINCIPAL));
+    assertEquals(KRB_PRINCIPAL.getName(), params.get(LoginParam.PRINCIPAL));
+    assertTrue(params.containsKey(LoginParam.KEYTAB));
+    assertEquals(null, params.get(LoginParam.KEYTAB));
+
+    AppConfigurationEntry[] entries = getKerberosEntries(params, 2);
+    checkKerberosEntry(entries[0], LoginModuleControlFlag.REQUIRED);
+    assertEquals(HadoopConfiguration.HADOOP_LOGIN, entries[1]);
+  }
+
+  @Test
+  public void testLoginParamsForSubjectPrincipalAndKeytabPath() {
+    Subject subject = createSubject(KRB_PRINCIPAL,
+        KeyTab.getInstance(KEYTAB_FILE));
+
+    LoginParams params = LoginParams.instanceFor(subject);
+    assertTrue(params.containsKey(LoginParam.SUBJECT_ONLY));
+    assertTrue(params.containsKey(LoginParam.UPDATED));
+    assertTrue(params.containsKey(LoginParam.PRINCIPAL));
+    assertEquals(KRB_PRINCIPAL.getName(), params.get(LoginParam.PRINCIPAL));
+    assertTrue(params.containsKey(LoginParam.KEYTAB));
+    assertEquals(KEYTAB_FILE.getPath(), params.get(LoginParam.KEYTAB));
+
+    AppConfigurationEntry[] entries = getKerberosEntries(params, 2);
+    checkKerberosEntry(entries[0], LoginModuleControlFlag.REQUIRED);
+    assertEquals(HadoopConfiguration.HADOOP_LOGIN, entries[1]);
   }
 }
